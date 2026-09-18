@@ -1,4 +1,5 @@
 import os
+import time
 import pickle
 import requests
 from fastapi import FastAPI
@@ -29,12 +30,54 @@ except FileNotFoundError:
     print("Error: model.pkl not found in this folder.")
     recommendation_model = None
 
-# --- Shopify Admin API config (from Render environment variables) ---
-SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
-SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN")
-SHOPIFY_API_VERSION = "2024-01"
+# --- Shopify config (from Render environment variables) ---
+SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")  # e.g. pje-2.myshopify.com
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")
+SHOPIFY_API_VERSION = "2026-07"
 
+TOKEN_URL = f"https://{SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token"
 GRAPHQL_URL = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+
+# In-memory token cache (simple, works fine for a single-instance API)
+_token_cache = {"access_token": None, "expires_at": 0}
+
+
+def get_access_token():
+    """Fetch a fresh Admin API access token using the client credentials grant,
+    reusing the cached one until it's close to expiring."""
+    now = time.time()
+    if _token_cache["access_token"] and _token_cache["expires_at"] > now + 60:
+        return _token_cache["access_token"]
+
+    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        print("Missing Shopify env vars: SHOPIFY_STORE_DOMAIN / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET")
+        return None
+
+    try:
+        response = requests.post(
+            TOKEN_URL,
+            json={
+                "client_id": SHOPIFY_CLIENT_ID,
+                "client_secret": SHOPIFY_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        access_token = data.get("access_token")
+        expires_in = data.get("expires_in", 3600)  # seconds
+
+        _token_cache["access_token"] = access_token
+        _token_cache["expires_at"] = now + expires_in
+
+        return access_token
+    except Exception as e:
+        print(f"Failed to get Shopify access token: {e}")
+        return None
+
 
 GRAPHQL_QUERY = """
 query getVariantByBarcode($query: String!) {
@@ -60,12 +103,13 @@ query getVariantByBarcode($query: String!) {
 
 def fetch_shopify_product_by_barcode(barcode: str):
     """Look up a Shopify product using its variant barcode via the Admin GraphQL API."""
-    if not SHOPIFY_STORE_DOMAIN or not SHOPIFY_ADMIN_TOKEN:
+    token = get_access_token()
+    if not token:
         return None
 
     headers = {
         "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+        "X-Shopify-Access-Token": token,
     }
     payload = {
         "query": GRAPHQL_QUERY,
@@ -76,6 +120,10 @@ def fetch_shopify_product_by_barcode(barcode: str):
         response = requests.post(GRAPHQL_URL, json=payload, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
+
+        if "errors" in data:
+            print(f"GraphQL errors for barcode {barcode}: {data['errors']}")
+            return None
 
         edges = (
             data.get("data", {})
@@ -110,21 +158,17 @@ def get_recommendations(product_id: str):
         if not isinstance(recommendation_model, dict):
             return {"error": "The .pkl file is a different format we haven't guessed yet."}
 
-        # 1. Try looking up the exact product ID text
         recommendations = recommendation_model.get(product_id)
 
-        # 2. If not found, try looking it up as an integer (number)
         if recommendations is None and product_id.isdigit():
             recommendations = recommendation_model.get(int(product_id))
 
-        # 3. If still not found, tell the user
         if recommendations is None:
             return {
                 "status": "not_found",
                 "message": f"Product ID {product_id} does not exist in the .pkl file."
             }
 
-        # 4. Enrich each recommendation with real Shopify product data
         enriched = []
         for rec in recommendations:
             design_no = rec.get("Design No") if isinstance(rec, dict) else rec
@@ -145,6 +189,15 @@ def get_recommendations(product_id: str):
 
     except Exception as e:
         return {"error": f"Something went wrong processing the model: {str(e)}"}
+
+
+@app.get("/debug/token")
+def debug_token():
+    """Temporary endpoint to check if token fetching works. Remove this once everything is confirmed."""
+    token = get_access_token()
+    if token:
+        return {"status": "success", "message": "Access token fetched successfully."}
+    return {"status": "failed", "message": "Could not fetch access token. Check Render logs for details."}
 
 
 if __name__ == "__main__":
